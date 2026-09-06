@@ -1,4 +1,3 @@
-
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./service-worker.js').catch(() => {});
 }
@@ -27,18 +26,8 @@ let folderStack = [];
 let currentItems = [];
 let currentFile = null;
 let currentText = '';
-let blobUrls = [];
 
 marked.setOptions({ gfm: true, breaks: true });
-marked.use({
-  renderer: {
-    code(code, language) {
-      const valid = language && hljs.getLanguage(language);
-      const highlighted = valid ? hljs.highlight(code, {language}).value : hljs.highlightAuto(code).value;
-      return `<pre><code class="hljs${valid ? ` language-${language}` : ''}">${highlighted}</code></pre>`;
-    }
-  }
-});
 
 function getConfig() {
   return {
@@ -100,15 +89,11 @@ function connectGoogle() {
   }
   tokenClient.requestAccessToken({ prompt: accessToken ? '' : 'consent' });
 }
-
 async function api(url, options={}) {
   if (!accessToken) throw new Error('Google 로그인이 필요합니다.');
   const response = await fetch(url, {
     ...options,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      ...(options.headers || {})
-    }
+    headers: { Authorization: `Bearer ${accessToken}`, ...(options.headers || {}) }
   });
   if (!response.ok) {
     let detail = '';
@@ -202,7 +187,6 @@ function renderList() {
       const bf = b.mimeType === FOLDER_MIME ? 0 : 1;
       return af - bf || a.name.localeCompare(b.name, 'ko');
     });
-
   els.fileList.innerHTML = '';
   if (!visible.length) {
     els.fileList.innerHTML = `<div class="file-row"><div class="file-main"><div class="file-name">표시할 Markdown 파일이 없습니다.</div></div></div>`;
@@ -243,9 +227,17 @@ async function goUp() {
   await refreshFolder();
 }
 
-function revokeBlobUrls() {
-  for (const url of blobUrls) URL.revokeObjectURL(url);
-  blobUrls = [];
+async function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+async function fileToDataUrl(file) {
+  const blob = await downloadBlob(file.id);
+  return blobToDataUrl(blob);
 }
 async function resolvePath(startFolderId, rawPath) {
   const clean = decodeURIComponent(rawPath).replace(/^\.?\//, '').split(/[?#]/)[0];
@@ -264,40 +256,56 @@ async function resolvePath(startFolderId, rawPath) {
   }
   return findNamedChild(folderId, parts[parts.length-1], false);
 }
-async function fileToBlobUrl(file) {
-  const blob = await downloadBlob(file.id);
-  const url = URL.createObjectURL(blob);
-  blobUrls.push(url);
-  return url;
-}
 async function prepareMarkdown(md, parentFolderId) {
-  revokeBlobUrls();
   let out = md;
 
-  // Obsidian image embeds: ![[Attachments/photo.jpg]] and ![[photo.jpg]]
+  // 메타데이터에 과거 blob URL이 있으면 읽기 화면에서는 보기 좋게 치환
+  out = out.replace(/^사진:\s*blob:[^\n]+$/m, '사진: 첨부 이미지');
+
+  // Obsidian embeds
   const wikiMatches = [...out.matchAll(/!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)];
   for (const m of wikiMatches) {
     const target = m[1].trim();
     let file = target.includes('/')
       ? await resolvePath(parentFolderId, target)
-      : await findByNameAnywhere(target);
+      : await findNamedChild(parentFolderId, target, false);
+    if (!file && !target.includes('/')) file = await findByNameAnywhere(target);
     if (file && file.mimeType !== FOLDER_MIME) {
-      const url = await fileToBlobUrl(file);
-      out = out.replace(m[0], `![](${url})`);
+      const dataUrl = await fileToDataUrl(file);
+      out = out.replace(m[0], `![](${dataUrl})`);
     }
   }
 
-  // Standard Markdown relative images.
+  // Standard relative images
   const imgMatches = [...out.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g)];
   for (const m of imgMatches) {
     const src = m[2].trim().replace(/^<|>$/g,'');
-    if (/^(?:https?:|data:|blob:)/i.test(src)) continue;
-    const file = await resolvePath(parentFolderId, src);
+    if (/^(?:https?:|data:)/i.test(src)) continue;
+    if (src.startsWith('blob:')) continue;
+
+    let file = await resolvePath(parentFolderId, src);
+    if (!file && !src.includes('/')) file = await findNamedChild(parentFolderId, src, false);
     if (file && file.mimeType !== FOLDER_MIME) {
-      const url = await fileToBlobUrl(file);
-      out = out.replace(m[2], url);
+      const dataUrl = await fileToDataUrl(file);
+      out = out.replace(m[2], dataUrl);
     }
   }
+
+  // PhotoMD 구조 보정: 같은 이름 이미지가 있으면 자동 표시
+  const hasImage = /!\[\[/.test(out) || /!\[[^\]]*\]\((?!blob:)[^)]+\)/.test(out);
+  if (!hasImage && currentFile?.name) {
+    const base = currentFile.name.replace(/\.md(?:own)?$/i, '');
+    for (const ext of ['jpeg','jpg','png','webp']) {
+      const file = await findNamedChild(parentFolderId, `${base}.${ext}`, false);
+      if (file) {
+        const dataUrl = await fileToDataUrl(file);
+        out = out.replace(/(# Seen & Kept[^\n]*\n?)/i, `$1\n\n![](${dataUrl})\n`);
+        if (!out.includes(dataUrl)) out += `\n\n![](${dataUrl})\n`;
+        break;
+      }
+    }
+  }
+
   return out;
 }
 async function renderCurrent() {
@@ -361,10 +369,7 @@ async function saveEdit() {
     els.saveBtn.disabled = false;
   }
 }
-function backToList() {
-  revokeBlobUrls();
-  show('browser');
-}
+function backToList() { show('browser'); }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
 }
@@ -374,7 +379,6 @@ function formatDate(s) {
   catch { return ''; }
 }
 
-// Events
 els.loginBtn.addEventListener('click', connectGoogle);
 els.welcomeLoginBtn.addEventListener('click', connectGoogle);
 els.settingsBtn.addEventListener('click', () => { loadSettingsInputs(); els.settingsDialog.showModal(); });
